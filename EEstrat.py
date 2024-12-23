@@ -523,7 +523,7 @@ def main(args):
     train_loader, test_loader = create_data_loaders(
         dataset_name=dataset,
         batch_size=args.batch_size,
-        num_workers=2,
+        num_workers=args.num_workers,
         seed=42
     )
     
@@ -594,6 +594,8 @@ if __name__ == "__main__":
                         help='Batch size for dataloaders')
     parser.add_argument('--fixed_cost', type=float, default=None,
                         help='Fixed cost to use for all exits. If None, costs are computed from parameters.')
+    parser.add_argument('--num_workers', type=int, default=2,
+                        help='Number of workers for data loading')
     
     args = parser.parse_args()
     main(args)
