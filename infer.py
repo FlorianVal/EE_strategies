@@ -49,7 +49,7 @@ def run_inference(
     device: torch.device,
     num_classes: int
 ) -> List[Dict]:
-    """Run inference on the test dataset.
+    """Run inference on the test dataset with batch processing.
     
     Args:
         model (torch.nn.Module): The early exit model
@@ -70,46 +70,54 @@ def run_inference(
     with torch.no_grad():
         for inputs, targets in tqdm(test_loader, desc="Running inference"):
             inputs, targets = inputs.to(device), targets.to(device)
+            batch_size = inputs.size(0)
             outputs = model(inputs)
-            past_key = ()
 
-            data_result = {"true_label": targets.item(), "exits": []}
-
-            for exit_name, output in outputs.items():
-                discretized_output = discretize_output(output, num_bins)
-                posterior_proba = find_matching_posterior_probs(
-                    p_k_l, past_key, discretized_output, num_classes
-                )
-                past_key += (discretized_output,)
-                
-                if len(A.shape) == 2:
-                    cost_of_stopping = compute_f(posterior_proba, A)
-                else:
-                    exits = ["exit1", "exit2", "exit3", "final"]
-                    cost_of_stopping = compute_f(posterior_proba, A[exits.index(exit_name)])
-                
-                exit_data = {
-                    "exit_name": exit_name,
-                    "discretized_output": discretized_output,
-                    "cost_of_stopping": cost_of_stopping,
+            # Process each sample in the batch
+            for sample_idx in range(batch_size):
+                past_key = ()
+                data_result = {
+                    "true_label": targets[sample_idx].item(),
+                    "exits": []
                 }
-                
-                if exit_name != "final":
-                    try:
-                        cost_of_continuation = v_l[past_key]
-                    except KeyError:
-                        cost_of_continuation = None
-                    exit_data["cost_of_continuation"] = cost_of_continuation
-                    exit_data["stopped"] = (
-                        cost_of_continuation is not None
-                        and cost_of_stopping < cost_of_continuation
+
+                for exit_name, output in outputs.items():
+                    # Get output for current sample
+                    sample_output = output[sample_idx:sample_idx+1]
+                    discretized_output = discretize_output(sample_output, num_bins)
+                    posterior_proba = find_matching_posterior_probs(
+                        p_k_l, past_key, discretized_output, num_classes
                     )
-                else:
-                    exit_data["stopped"] = True
+                    past_key += (discretized_output,)
+                    
+                    if len(A.shape) == 2:
+                        cost_of_stopping = compute_f(posterior_proba, A)
+                    else:
+                        exits = ["exit1", "exit2", "exit3", "final"]
+                        cost_of_stopping = compute_f(posterior_proba, A[exits.index(exit_name)])
+                    
+                    exit_data = {
+                        "exit_name": exit_name,
+                        "discretized_output": discretized_output,
+                        "cost_of_stopping": cost_of_stopping,
+                    }
+                    
+                    if exit_name != "final":
+                        try:
+                            cost_of_continuation = v_l[past_key]
+                        except KeyError:
+                            cost_of_continuation = None
+                        exit_data["cost_of_continuation"] = cost_of_continuation
+                        exit_data["stopped"] = (
+                            cost_of_continuation is not None
+                            and cost_of_stopping < cost_of_continuation
+                        )
+                    else:
+                        exit_data["stopped"] = True
+                    
+                    data_result["exits"].append(exit_data)
                 
-                data_result["exits"].append(exit_data)
-            
-            results.append(data_result)
+                results.append(data_result)
     
     return results
 
