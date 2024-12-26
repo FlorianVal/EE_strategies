@@ -73,22 +73,32 @@ def run_inference(
             batch_size = inputs.size(0)
             outputs = model(inputs)
 
-            # Process each sample in the batch
-            for sample_idx in range(batch_size):
-                past_key = ()
-                data_result = {
-                    "true_label": targets[sample_idx].item(),
+            # Initialize batch results
+            batch_results = [
+                {
+                    "true_label": targets[i].item(),
                     "exits": []
                 }
+                for i in range(batch_size)
+            ]
+            
+            # Initialize past keys for each sample in batch
+            past_keys = [()] * batch_size
 
-                for exit_name, output in outputs.items():
-                    # Get output for current sample
-                    sample_output = output[sample_idx:sample_idx+1]
-                    discretized_output = discretize_output(sample_output, num_bins)
+            # Process each exit for the entire batch
+            for exit_name, output in outputs.items():
+                # Discretize entire batch output at once
+                discretized_outputs = discretize_output(output, num_bins)
+                
+                # Process each sample in parallel
+                for sample_idx in range(batch_size):
+                    past_key = past_keys[sample_idx]
+                    discretized_output = discretized_outputs[sample_idx]
+                    
                     posterior_proba = find_matching_posterior_probs(
                         p_k_l, past_key, discretized_output, num_classes
                     )
-                    past_key += (discretized_output,)
+                    past_keys[sample_idx] = past_key + (discretized_output,)
                     
                     if len(A.shape) == 2:
                         cost_of_stopping = compute_f(posterior_proba, A)
@@ -115,9 +125,10 @@ def run_inference(
                     else:
                         exit_data["stopped"] = True
                     
-                    data_result["exits"].append(exit_data)
-                
-                results.append(data_result)
+                    batch_results[sample_idx]["exits"].append(exit_data)
+            
+            # Add batch results to overall results
+            results.extend(batch_results)
     
     return results
 

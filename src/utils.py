@@ -145,8 +145,6 @@ def discretize_output(output: torch.Tensor, num_bins: int) -> List[Tuple[int, in
         # Round to 2 decimal places
         discretized = round(discretized * 100) / 100
         result.append((discretized, argmax))
-        if len(result) == 1:
-            return result[0]
     return tuple(result)
 
 def estimate_conditional_probabilities(model: nn.Module, dataloader: torch.utils.data.DataLoader, num_bins: int) -> Dict:
