@@ -137,11 +137,18 @@ def main(args):
     
     # Parse model path and set up parameters
     dataset, base_model = parse_model_path(args.model_path)
-    num_classes = 10 if dataset == "cifar10" else 100
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
     
-    # Load model
+    # Load datasets
+    train_loader, test_loader, num_classes = create_data_loaders(
+        dataset_name=dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        seed=42
+    )
+    
+    # Load the model
     model = load_model(args.model_path, num_classes, base_model)
     
     # Set up experiment directory
@@ -160,14 +167,6 @@ def main(args):
     else:
         A_path = os.path.join(exp_dir, f"{args.a_matrix_type}_A.json")
     A = torch.tensor(load_json_file(A_path))
-    
-    # Create data loader
-    _, test_loader = create_data_loaders(
-        dataset_name=dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        seed=42
-    )
     
     # Run inference
     logger.info("Running inference on test set")

@@ -501,10 +501,6 @@ def main(args):
     logger.info("Starting experiment: %s", args.exp_name)
 
     dataset, base_model = parse_model_path(args.model_path)
-    if dataset == "cifar10":
-        num_classes = 10
-    elif dataset == "cifar100":
-        num_classes = 100
     
     # Create experiment directory and save arguments
     exp_dir = os.path.join("experiments", args.exp_name)
@@ -512,20 +508,20 @@ def main(args):
     save_args(args, exp_dir)
     logger.info("Created experiment directory at: %s", exp_dir)
     
+    # Load datasets
+    train_loader, test_loader, num_classes = create_data_loaders(
+        dataset_name=dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        seed=42
+    )
+    
     # Load the model
     model = load_model(args.model_path, num_classes, base_model)
     
     # Compute exit costs
     exit_costs = compute_exit_costs(model, args.fixed_cost)
     logger.info("Exit costs: %s", exit_costs)
-    
-    # Load datasets
-    train_loader, test_loader = create_data_loaders(
-        dataset_name=dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        seed=42
-    )
     
     # Compute conditional probabilities
     logger.info("Computing conditional probabilities")
