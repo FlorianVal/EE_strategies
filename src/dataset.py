@@ -16,13 +16,16 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 STL10_MEAN = (0.4467, 0.4398, 0.4066)
 STL10_STD = (0.2603, 0.2566, 0.2713)
+CARS_MEAN = (0.485, 0.456, 0.406)  # Using ImageNet stats as a good default for car images
+CARS_STD = (0.229, 0.224, 0.225)
 
 # Dataset information
 DATASET_INFO = {
     "cifar10": {"num_classes": 10, "mean": CIFAR10_MEAN, "std": CIFAR10_STD},
     "cifar100": {"num_classes": 100, "mean": CIFAR100_MEAN, "std": CIFAR100_STD},
     "imagenet_subset": {"num_classes": 1000, "mean": IMAGENET_MEAN, "std": IMAGENET_STD},
-    "stl10": {"num_classes": 10, "mean": STL10_MEAN, "std": STL10_STD}
+    "stl10": {"num_classes": 10, "mean": STL10_MEAN, "std": STL10_STD},
+    "stanford_cars": {"num_classes": 196, "mean": CARS_MEAN, "std": CARS_STD}
 }
 
 def get_cifar10(train=True):
@@ -97,6 +100,30 @@ def get_stl10(train=True):
         transform=transform
     )
 
+def get_stanford_cars(train=True):
+    """Get Stanford Cars dataset with standard transforms."""
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(CARS_MEAN, CARS_STD)
+    ])
+    
+    if train:
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(15),
+            transforms.ToTensor(),
+            transforms.Normalize(CARS_MEAN, CARS_STD)
+        ])
+    
+    split = 'train' if train else 'test'
+    return datasets.StanfordCars(
+        root=f"{DATA_DIR}/stanford-cars-dataset",
+        split=split,
+        transform=transform
+    )
+
 def get_dataset(name: str, train: bool = True):
     """Get dataset and its number of classes."""
     if name not in DATASET_INFO:
@@ -110,6 +137,8 @@ def get_dataset(name: str, train: bool = True):
         dataset = get_imagenet_subset(train)
     elif name == "stl10":
         dataset = get_stl10(train)
+    elif name == "stanford_cars":
+        dataset = get_stanford_cars(train)
     
     return dataset, DATASET_INFO[name]["num_classes"]
 
