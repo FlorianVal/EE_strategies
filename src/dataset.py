@@ -14,12 +14,15 @@ CIFAR100_MEAN = (0.5071, 0.4867, 0.4408)
 CIFAR100_STD = (0.2675, 0.2565, 0.2761)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+STL10_MEAN = (0.4467, 0.4398, 0.4066)
+STL10_STD = (0.2603, 0.2566, 0.2713)
 
 # Dataset information
 DATASET_INFO = {
     "cifar10": {"num_classes": 10, "mean": CIFAR10_MEAN, "std": CIFAR10_STD},
     "cifar100": {"num_classes": 100, "mean": CIFAR100_MEAN, "std": CIFAR100_STD},
-    "imagenet_subset": {"num_classes": 1000, "mean": IMAGENET_MEAN, "std": IMAGENET_STD}
+    "imagenet_subset": {"num_classes": 1000, "mean": IMAGENET_MEAN, "std": IMAGENET_STD},
+    "stl10": {"num_classes": 10, "mean": STL10_MEAN, "std": STL10_STD}
 }
 
 def get_cifar10(train=True):
@@ -39,7 +42,60 @@ def get_cifar100(train=True):
     )
 
 def get_imagenet_subset(train=True):
-    raise NotImplementedError("ImageNet subset is not implemented yet.")
+    """Get ImageNet dataset with standard transforms."""
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
+    ])
+    
+    if train:
+        transform = transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
+        ])
+    
+    split = 'train' if train else 'val'
+    try:
+        return datasets.ImageNet(
+            root=f"{DATA_DIR}/imagenet",
+            split=split,
+            transform=transform
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to load ImageNet. Make sure you have:\n"
+            "1. Downloaded ImageNet from https://image-net.org/\n"
+            "2. Placed it in data/imagenet with train/ and val/ subdirectories\n"
+            "3. Applied the validation directory structure preprocessing\n"
+            f"Error: {str(e)}"
+        )
+
+def get_stl10(train=True):
+    """Get STL10 dataset with standard transforms."""
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(STL10_MEAN, STL10_STD)
+    ])
+    
+    if train:
+        transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomCrop(96, padding=4),
+            transforms.ToTensor(),
+            transforms.Normalize(STL10_MEAN, STL10_STD)
+        ])
+    
+    split = 'train' if train else 'test'
+    return datasets.STL10(
+        root=DATA_DIR,
+        split=split,
+        download=True,
+        transform=transform
+    )
 
 def get_dataset(name: str, train: bool = True):
     """Get dataset and its number of classes."""
@@ -52,6 +108,8 @@ def get_dataset(name: str, train: bool = True):
         dataset = get_cifar100(train)
     elif name == "imagenet_subset":
         dataset = get_imagenet_subset(train)
+    elif name == "stl10":
+        dataset = get_stl10(train)
     
     return dataset, DATASET_INFO[name]["num_classes"]
 

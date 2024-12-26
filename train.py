@@ -200,7 +200,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train Early Exit ResNet')
     
     # Dataset parameters
-    parser.add_argument('--dataset', type=str, default='cifar10', choices=['cifar10', 'cifar100'],
+    parser.add_argument('--dataset', type=str, default='cifar10', choices=['cifar10', 'cifar100', 'stl10'],
                       help='Dataset to use')
     parser.add_argument('--batch-size', type=int, default=128,
                       help='Batch size for training')
