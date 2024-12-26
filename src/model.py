@@ -31,7 +31,9 @@ class EarlyExitResNet(nn.Module):
         self.aux_head2 = self._make_aux_head(self.features_exit2, num_classes)
         self.aux_head3 = self._make_aux_head(self.features_exit3, num_classes)
         
-        # Final classification head
+        # Final classification layers
+        self.final_bn = nn.BatchNorm1d(self.features_final)
+        self.final_dropout = nn.Dropout(p=0.5)
         self.fc = nn.Linear(self.features_final, num_classes)
         self.softmax = nn.Softmax(dim=1)
         
@@ -39,6 +41,8 @@ class EarlyExitResNet(nn.Module):
         return nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
+            nn.BatchNorm1d(in_features),
+            nn.Dropout(p=0.5),
             nn.Linear(in_features, num_classes),
             nn.Softmax(dim=1)
         )
@@ -64,6 +68,8 @@ class EarlyExitResNet(nn.Module):
         x = self.base_model[7](x)  # Layer4
         x = self.base_model[8](x)  # AvgPool
         x = torch.flatten(x, 1)
+        x = self.final_bn(x)
+        x = self.final_dropout(x)
         final = self.fc(x)
         final = self.softmax(final)
         
