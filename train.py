@@ -373,6 +373,12 @@ def parse_args():
         default="",
         help="Experiment name to be included in the save directory",
     )
+    parser.add_argument(
+        "--gpu-id",
+        type=int,
+        default=0,
+        help="ID of GPU to use for training (-1 for CPU)",
+    )
 
     return parser.parse_args()
 
@@ -385,8 +391,11 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
 
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Set device based on gpu-id
+    if args.gpu_id >= 0 and torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.gpu_id}")
+    else:
+        device = torch.device("cpu")
     logger.info(f"Using device: {device}")
 
     # Create save directory with timestamp and experiment name
