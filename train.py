@@ -60,7 +60,7 @@ class SumCEStrategy(TrainingStrategy):
 
     def create_criterion(self) -> nn.Module:
         return nn.CrossEntropyLoss()
-  
+
     def compute_loss(
         self, outputs: dict, target: torch.Tensor, criterion: nn.Module
     ) -> torch.Tensor:
@@ -108,13 +108,9 @@ class KLConsistencyStrategy(TrainingStrategy):
             current_exit = outputs[exit_names[i]]
             next_exit = outputs[exit_names[i + 1]]
 
-            # Apply softmax to get probability distributions
-            current_probs = torch.nn.functional.softmax(current_exit, dim=1)
-            next_probs = torch.nn.functional.softmax(next_exit, dim=1)
-
             # Calculate KL divergence
             kl_div = torch.nn.functional.kl_div(
-                current_probs.log(), next_probs, reduction="batchmean"
+                current_exit.log(), next_exit, reduction="batchmean"
             )
 
             loss += self.beta * kl_div
@@ -122,11 +118,82 @@ class KLConsistencyStrategy(TrainingStrategy):
         return loss
 
 
+class MultiTruthPenaltyStrategy(TrainingStrategy):
+    """Training strategy that uses CE loss with a penalty based on maximum confidence across exits."""
+
+    def __init__(self, lambda_penalty: float = 0.5):
+        """Initialize with lambda parameter for penalty weight."""
+        self.lambda_penalty = lambda_penalty
+
+    def create_optimizer(
+        self, model: nn.Module, lr: float, momentum: float, weight_decay: float
+    ) -> torch.optim.Optimizer:
+        return optim.SGD(
+            model.parameters(),
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+
+    def create_criterion(self) -> nn.Module:
+        return nn.CrossEntropyLoss()
+
+    def compute_metric(self, logits: torch.Tensor) -> torch.Tensor:
+        """Compute the confidence metric for each head.
+
+        Args:
+            logits: Tensor of shape [B, K] where B is batch size and K is number of classes
+
+        Returns:
+            Tensor of shape [B] containing the metric value for each sample
+        """
+        return torch.max(logits, dim=1)[0]  # Returns maximum confidence for each sample
+
+    def compute_loss(
+        self, outputs: dict, target: torch.Tensor, criterion: nn.Module
+    ) -> torch.Tensor:
+        # Stack all exit outputs to create matrix O of shape [H, B, K]
+        # where H is number of heads, B is batch size, K is number of classes
+        exit_names = sorted(outputs.keys())
+        stacked_outputs = torch.stack([outputs[name] for name in exit_names])
+
+        # Compute metric C for each head and sample: shape [H, B]
+        metrics = torch.stack(
+            [self.compute_metric(exit_output) for exit_output in stacked_outputs]
+        )
+
+        # Find the head with maximum metric for each sample
+        max_metric_indices = torch.argmax(metrics, dim=0)  # Shape: [B]
+
+        # Select the logits from the heads with maximum metric
+        batch_indices = torch.arange(target.size(0), device=target.device)
+        selected_logits = stacked_outputs[max_metric_indices, batch_indices]
+
+        # Compute main classification loss
+        main_loss = criterion(selected_logits, target)
+
+        # Compute penalty using remaining heads
+        # Sort metrics for each sample and exclude the maximum
+        sorted_metrics, _ = torch.sort(metrics, dim=0, descending=True)
+        remaining_metrics = sorted_metrics[1:]  # Exclude the maximum metric
+
+        # Average the remaining metrics for the penalty
+        penalty = torch.mean(
+            remaining_metrics, dim=0
+        ).mean()  # Average across heads then batch
+
+        # Combine losses
+        total_loss = main_loss + self.lambda_penalty * penalty
+
+        return total_loss
+
+
 # Factory function to get training strategy
 def get_training_strategy(strategy_name: str, **kwargs) -> TrainingStrategy:
     strategies = {
         "sum_ce": lambda: SumCEStrategy(),
         "kl_consistency": lambda: KLConsistencyStrategy(**kwargs),
+        "multi_truth_penalty": lambda: MultiTruthPenaltyStrategy(**kwargs),
     }
     if strategy_name not in strategies:
         raise ValueError(f"Unknown training strategy: {strategy_name}")
@@ -202,8 +269,7 @@ class Trainer:
         # Calculate metrics
         avg_loss = total_loss / len(self.train_loader)
         accuracies = {
-            exit_name: (100.0 * corr / total)
-            for exit_name, corr in correct.items()
+            exit_name: (100.0 * corr / total) for exit_name, corr in correct.items()
         }
 
         # Log epoch metrics to TensorBoard
@@ -226,9 +292,7 @@ class Trainer:
                 outputs = self.model(data)
 
                 # Calculate validation loss using the strategy
-                loss = self.strategy.compute_loss(
-                    outputs, target, self.criterion
-                )
+                loss = self.strategy.compute_loss(outputs, target, self.criterion)
 
                 total_loss += loss.item()
                 total += target.size(0)
@@ -241,8 +305,7 @@ class Trainer:
         # Calculate metrics
         avg_loss = total_loss / len(self.val_loader)
         accuracies = {
-            exit_name: (100.0 * corr / total)
-            for exit_name, corr in correct.items()
+            exit_name: (100.0 * corr / total) for exit_name, corr in correct.items()
         }
 
         # Log validation metrics to TensorBoard
@@ -271,9 +334,7 @@ class Trainer:
         # Try to log model graph to TensorBoard, but don't fail if it doesn't work
         try:
             dummy_input = torch.randn(1, 3, 32, 32).to(self.device)
-            self.writer.add_graph(
-                self.model, dummy_input, use_strict_trace=False
-            )
+            self.writer.add_graph(self.model, dummy_input, use_strict_trace=False)
         except Exception as e:
             logger.warning(f"Failed to add model graph to TensorBoard: {e}")
 
@@ -339,9 +400,7 @@ def parse_args():
     parser.add_argument(
         "--momentum", type=float, default=0.9, help="Momentum for SGD optimizer"
     )
-    parser.add_argument(
-        "--weight-decay", type=float, default=5e-4, help="Weight decay"
-    )
+    parser.add_argument("--weight-decay", type=float, default=5e-4, help="Weight decay")
     parser.add_argument(
         "--training-strategy",
         type=str,
@@ -349,6 +408,7 @@ def parse_args():
         choices=[
             "sum_ce",
             "kl_consistency",
+            "multi_truth_penalty",
         ],  # Add more strategies as they are implemented
         help="Training strategy to use",
     )
@@ -357,6 +417,12 @@ def parse_args():
         type=float,
         default=0.5,
         help="Weight for KL divergence penalty in kl_consistency strategy",
+    )
+    parser.add_argument(
+        "--lambda-penalty",
+        type=float,
+        default=0.5,
+        help="Weight for the penalty term in multi_truth_penalty strategy",
     )
 
     # Other parameters
@@ -440,6 +506,8 @@ def main():
     strategy_kwargs = {}
     if args.training_strategy == "kl_consistency":
         strategy_kwargs["beta"] = args.beta
+    if args.training_strategy == "multi_truth_penalty":
+        strategy_kwargs["lambda_penalty"] = args.lambda_penalty
     strategy = get_training_strategy(args.training_strategy, **strategy_kwargs)
 
     # Create optimizer and criterion using the strategy
