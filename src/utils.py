@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from tqdm import tqdm
 import json
 import logging
+import os
 
 def count_parameters(model: nn.Module) -> List[int]:
     """
@@ -564,9 +565,13 @@ def parse_model_path(model_path: str) -> tuple:
         tuple: (dataset_name, base_model_name)
     """
     try:
-        parts = model_path.split("_")
-        dataset = parts[-2]
-        base_model = parts[-1].split(".")[0]
+        # get last directory name
+        if os.path.isdir(model_path):
+            dir_name = os.path.basename(model_path)
+        else:
+            dir_name = os.path.dirname(model_path)
+        dataset = dir_name.split("_")[0]
+        base_model = dir_name.split("_")[1]
         
         if dataset not in ["cifar10", "cifar100"]:
             raise ValueError(f"Dataset {dataset} not recognized. Expected 'cifar10' or 'cifar100'")
@@ -577,4 +582,4 @@ def parse_model_path(model_path: str) -> tuple:
         return dataset, base_model
     except Exception as e:
         logging.error("Failed to parse model path: %s", str(e))
-        raise ValueError("Invalid model path format. Expected: path/to/model_datasetname_modelname.pth")
+        raise ValueError(f"Invalid model path format. Expected: path/to/model_datasetname_modelname.pth, got: {model_path}")
