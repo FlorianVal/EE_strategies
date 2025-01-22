@@ -3,201 +3,24 @@ import logging
 import os
 import json
 from datetime import datetime
-from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from src.model import create_early_exit_resnet
 from src.dataset import create_data_loaders
 from src.utils import count_parameters, count_flops
+from src.strategies import get_training_strategy
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-
-class TrainingStrategy(ABC):
-    """Abstract base class for different training strategies."""
-
-    @abstractmethod
-    def create_optimizer(
-        self, model: nn.Module, lr: float, momentum: float, weight_decay: float
-    ) -> torch.optim.Optimizer:
-        """Create the optimizer for the training strategy."""
-        pass
-
-    @abstractmethod
-    def create_criterion(self) -> nn.Module:
-        """Create the loss criterion for the training strategy."""
-        pass
-
-    @abstractmethod
-    def compute_loss(
-        self, outputs: dict, target: torch.Tensor, criterion: nn.Module
-    ) -> torch.Tensor:
-        """Compute the loss based on the strategy."""
-        pass
-
-
-class SumCEStrategy(TrainingStrategy):
-    """Training strategy that uses sum of cross-entropy losses from all exits."""
-
-    def create_optimizer(
-        self, model: nn.Module, lr: float, momentum: float, weight_decay: float
-    ) -> torch.optim.Optimizer:
-        return optim.SGD(
-            model.parameters(),
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
-
-    def create_criterion(self) -> nn.Module:
-        return nn.CrossEntropyLoss()
-
-    def compute_loss(
-        self, outputs: dict, target: torch.Tensor, criterion: nn.Module
-    ) -> torch.Tensor:
-        loss = torch.tensor(0.0, device=target.device)
-        for exit_output in outputs.values():
-            loss += criterion(exit_output, target)
-        return loss
-
-
-class KLConsistencyStrategy(TrainingStrategy):
-    """Training strategy that uses CE loss + KL divergence penalty between consecutive exits."""
-
-    def __init__(self, beta: float = 0.5):
-        """Initialize with beta parameter for KL penalty weight."""
-        self.beta = beta
-
-    def create_optimizer(
-        self, model: nn.Module, lr: float, momentum: float, weight_decay: float
-    ) -> torch.optim.Optimizer:
-        return optim.SGD(
-            model.parameters(),
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
-
-    def create_criterion(self) -> nn.Module:
-        return nn.CrossEntropyLoss()
-
-    def compute_loss(
-        self, outputs: dict, target: torch.Tensor, criterion: nn.Module
-    ) -> torch.Tensor:
-        # Initialize loss with CE for each exit
-        loss = torch.tensor(0.0, device=target.device)
-
-        # Sort exits by name to ensure consistent ordering
-        exit_names = sorted(outputs.keys())
-
-        # Add CE loss for each exit
-        for exit_name in exit_names:
-            loss += criterion(outputs[exit_name], target)
-
-        # Add KL divergence penalty between consecutive exits
-        for i in range(len(exit_names) - 1):
-            current_exit = outputs[exit_names[i]]
-            next_exit = outputs[exit_names[i + 1]]
-
-            # Calculate KL divergence
-            kl_div = torch.nn.functional.kl_div(
-                current_exit.log(), next_exit, reduction="batchmean"
-            )
-
-            loss += self.beta * kl_div
-
-        return loss
-
-
-class MultiTruthPenaltyStrategy(TrainingStrategy):
-    """Training strategy that uses CE loss with a penalty based on maximum confidence across exits."""
-
-    def __init__(self, lambda_penalty: float = 0.5):
-        """Initialize with lambda parameter for penalty weight."""
-        self.lambda_penalty = lambda_penalty
-
-    def create_optimizer(
-        self, model: nn.Module, lr: float, momentum: float, weight_decay: float
-    ) -> torch.optim.Optimizer:
-        return optim.SGD(
-            model.parameters(),
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
-
-    def create_criterion(self) -> nn.Module:
-        return nn.CrossEntropyLoss()
-
-    def compute_metric(self, logits: torch.Tensor) -> torch.Tensor:
-        """Compute the confidence metric for each head.
-
-        Args:
-            logits: Tensor of shape [B, K] where B is batch size and K is number of classes
-
-        Returns:
-            Tensor of shape [B] containing the metric value for each sample
-        """
-        return torch.max(logits, dim=1)[0]  # Returns maximum confidence for each sample
-
-    def compute_loss(
-        self, outputs: dict, target: torch.Tensor, criterion: nn.Module
-    ) -> torch.Tensor:
-        # Stack all exit outputs to create matrix O of shape [H, B, K]
-        # where H is number of heads, B is batch size, K is number of classes
-        exit_names = sorted(outputs.keys())
-        stacked_outputs = torch.stack([outputs[name] for name in exit_names])
-
-        # Compute metric C for each head and sample: shape [H, B]
-        metrics = torch.stack(
-            [self.compute_metric(exit_output) for exit_output in stacked_outputs]
-        )
-
-        # Find the head with maximum metric for each sample
-        max_metric_indices = torch.argmax(metrics, dim=0)  # Shape: [B]
-
-        # Select the logits from the heads with maximum metric
-        batch_indices = torch.arange(target.size(0), device=target.device)
-        selected_logits = stacked_outputs[max_metric_indices, batch_indices]
-
-        # Compute main classification loss
-        main_loss = criterion(selected_logits, target)
-
-        # Compute penalty using remaining heads
-        # Sort metrics for each sample and exclude the maximum
-        sorted_metrics, _ = torch.sort(metrics, dim=0, descending=True)
-        remaining_metrics = sorted_metrics[1:]  # Exclude the maximum metric
-
-        # Average the remaining metrics for the penalty
-        penalty = torch.mean(
-            remaining_metrics, dim=0
-        ).mean()  # Average across heads then batch
-
-        # Combine losses
-        total_loss = main_loss + self.lambda_penalty * penalty
-
-        return total_loss
-
-
-# Factory function to get training strategy
-def get_training_strategy(strategy_name: str, **kwargs) -> TrainingStrategy:
-    strategies = {
-        "sum_ce": lambda: SumCEStrategy(),
-        "kl_consistency": lambda: KLConsistencyStrategy(**kwargs),
-        "multi_truth_penalty": lambda: MultiTruthPenaltyStrategy(**kwargs),
-    }
-    if strategy_name not in strategies:
-        raise ValueError(f"Unknown training strategy: {strategy_name}")
-    return strategies[strategy_name]()
 
 
 class Trainer:
@@ -210,7 +33,8 @@ class Trainer:
         criterion: nn.Module,
         device: torch.device,
         save_dir: str,
-        strategy: TrainingStrategy,
+        strategy,
+        scheduler=None,
     ):
         self.model = model
         self.train_loader = train_loader
@@ -220,6 +44,7 @@ class Trainer:
         self.device = device
         self.save_dir = save_dir
         self.strategy = strategy
+        self.scheduler = scheduler
 
         # Create save directory if it doesn't exist
         os.makedirs(save_dir, exist_ok=True)
@@ -227,12 +52,29 @@ class Trainer:
         # Initialize TensorBoard writer
         self.writer = SummaryWriter(os.path.join(save_dir, "tensorboard"))
 
+    def compute_entropy(self, logits):
+        """Compute entropy of softmax probabilities."""
+        probs = F.softmax(logits, dim=1)
+        log_probs = F.log_softmax(logits, dim=1)
+        return -(probs * log_probs).sum(dim=1)
+
     def train_epoch(self, epoch: int) -> dict:
         """Train for one epoch."""
         self.model.train()
+
+        # Set all BatchNorm layers to eval mode if batch size is 1
+        if next(iter(self.train_loader))[0].size(0) == 1:
+            for module in self.model.modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    module.eval()
+
         total_loss = 0.0
         correct = {"exit1": 0, "exit2": 0, "exit3": 0, "final": 0}
         total = 0
+
+        # For tracking entropy-based selection accuracy
+        selected_correct = {"exit1": 0, "exit2": 0, "exit3": 0, "final": 0}
+        selected_total = {"exit1": 0, "exit2": 0, "exit3": 0, "final": 0}
 
         for batch_idx, (data, target) in enumerate(self.train_loader):
             data, target = data.to(self.device), target.to(self.device)
@@ -240,7 +82,8 @@ class Trainer:
 
             # Forward pass
             outputs = self.model(data)
-
+            if batch_idx == 0:
+                logger.info(f"Outputs for class {target[0].item()}: \n{[f'{x:.2f}' for x in outputs['exit1'][0].tolist()]}\n{[f'{x:.2f}' for x in outputs['exit2'][0].tolist()]}\n{[f'{x:.2f}' for x in outputs['exit3'][0].tolist()]}\n{[f'{x:.2f}' for x in outputs['final'][0].tolist()]}")
             # Calculate loss using the strategy
             loss = self.strategy.compute_loss(outputs, target, self.criterion)
 
@@ -248,14 +91,39 @@ class Trainer:
             loss.backward()
             self.optimizer.step()
 
+            # Step the scheduler if it exists
+            if self.scheduler is not None:
+                self.scheduler.step()
+                # Log learning rate
+                if batch_idx % 100 == 0:
+                    current_lr = self.scheduler.get_last_lr()[0]
+                    self.writer.add_scalar("train/learning_rate", current_lr, epoch * len(self.train_loader) + batch_idx)
+
             total_loss += loss.item()
             total += target.size(0)
 
-            # Calculate accuracy for each exit
+            # Calculate accuracy for each exit and entropy-based selection
             with torch.no_grad():
+                # Calculate entropy for each exit
+                entropies = {exit_name: self.compute_entropy(exit_output) 
+                           for exit_name, exit_output in outputs.items()}
+                
+                # Find exit with minimum entropy for each sample
+                entropy_tensor = torch.stack([entropy for entropy in entropies.values()])
+                min_entropy_indices = entropy_tensor.argmin(dim=0)
+                
                 for exit_name, exit_output in outputs.items():
                     pred = exit_output.argmax(dim=1)
                     correct[exit_name] += pred.eq(target).sum().item()
+                    
+                    # Get index for current exit
+                    exit_idx = list(outputs.keys()).index(exit_name)
+                    
+                    # Find samples where this exit had minimum entropy
+                    selected_mask = (min_entropy_indices == exit_idx)
+                    if selected_mask.sum() > 0:
+                        selected_correct[exit_name] += pred[selected_mask].eq(target[selected_mask]).sum().item()
+                        selected_total[exit_name] += selected_mask.sum().item()
 
             # Log batch loss to TensorBoard
             global_step = epoch * len(self.train_loader) + batch_idx
@@ -271,13 +139,27 @@ class Trainer:
         accuracies = {
             exit_name: (100.0 * corr / total) for exit_name, corr in correct.items()
         }
+        
+        # Calculate entropy-based selection accuracies
+        selected_accuracies = {
+            exit_name: (100.0 * selected_correct[exit_name] / selected_total[exit_name])
+            if selected_total[exit_name] > 0 else 0.0
+            for exit_name in selected_correct.keys()
+        }
 
         # Log epoch metrics to TensorBoard
         self.writer.add_scalar("train/epoch_loss", avg_loss, epoch)
         for exit_name, acc in accuracies.items():
             self.writer.add_scalar(f"train/accuracy_{exit_name}", acc, epoch)
+        for exit_name, acc in selected_accuracies.items():
+            self.writer.add_scalar(f"train/selected_accuracy_{exit_name}", acc, epoch)
 
-        return {"loss": avg_loss, "accuracies": accuracies}
+        return {
+            "loss": avg_loss, 
+            "accuracies": accuracies,
+            "selected_accuracies": selected_accuracies,
+            "selected_samples": selected_total
+        }
 
     def validate(self, epoch: int) -> dict:
         """Validate the model."""
@@ -285,6 +167,10 @@ class Trainer:
         total_loss = 0.0
         correct = {"exit1": 0, "exit2": 0, "exit3": 0, "final": 0}
         total = 0
+
+        # For tracking entropy-based selection accuracy
+        selected_correct = {"exit1": 0, "exit2": 0, "exit3": 0, "final": 0}
+        selected_total = {"exit1": 0, "exit2": 0, "exit3": 0, "final": 0}
 
         with torch.no_grad():
             for data, target in self.val_loader:
@@ -297,23 +183,54 @@ class Trainer:
                 total_loss += loss.item()
                 total += target.size(0)
 
+                # Calculate entropy for each exit
+                entropies = {exit_name: self.compute_entropy(exit_output) 
+                           for exit_name, exit_output in outputs.items()}
+                
+                # Find exit with minimum entropy for each sample
+                entropy_tensor = torch.stack([entropy for entropy in entropies.values()])
+                min_entropy_indices = entropy_tensor.argmin(dim=0)
+
                 # Calculate accuracy for each exit
                 for exit_name, exit_output in outputs.items():
                     pred = exit_output.argmax(dim=1)
                     correct[exit_name] += pred.eq(target).sum().item()
+                    
+                    # Get index for current exit
+                    exit_idx = list(outputs.keys()).index(exit_name)
+                    
+                    # Find samples where this exit had minimum entropy
+                    selected_mask = (min_entropy_indices == exit_idx)
+                    if selected_mask.sum() > 0:
+                        selected_correct[exit_name] += pred[selected_mask].eq(target[selected_mask]).sum().item()
+                        selected_total[exit_name] += selected_mask.sum().item()
 
         # Calculate metrics
         avg_loss = total_loss / len(self.val_loader)
         accuracies = {
             exit_name: (100.0 * corr / total) for exit_name, corr in correct.items()
         }
+        
+        # Calculate entropy-based selection accuracies
+        selected_accuracies = {
+            exit_name: (100.0 * selected_correct[exit_name] / selected_total[exit_name])
+            if selected_total[exit_name] > 0 else 0.0
+            for exit_name in selected_correct.keys()
+        }
 
         # Log validation metrics to TensorBoard
         self.writer.add_scalar("val/epoch_loss", avg_loss, epoch)
         for exit_name, acc in accuracies.items():
             self.writer.add_scalar(f"val/accuracy_{exit_name}", acc, epoch)
+        for exit_name, acc in selected_accuracies.items():
+            self.writer.add_scalar(f"val/selected_accuracy_{exit_name}", acc, epoch)
 
-        return {"loss": avg_loss, "accuracies": accuracies}
+        return {
+            "loss": avg_loss, 
+            "accuracies": accuracies,
+            "selected_accuracies": selected_accuracies,
+            "selected_samples": selected_total
+        }
 
     def save_checkpoint(self, metrics: dict, epoch: int):
         """Save model checkpoint."""
@@ -346,12 +263,18 @@ class Trainer:
             logger.info(f"Train Loss: {train_metrics['loss']:.6f}")
             for exit_name, acc in train_metrics["accuracies"].items():
                 logger.info(f"Train Accuracy ({exit_name}): {acc:.2f}%")
+            for exit_name, acc in train_metrics["selected_accuracies"].items():
+                samples = train_metrics["selected_samples"][exit_name]
+                logger.info(f"Train Selected Accuracy ({exit_name}): {acc:.2f}% ({samples} samples)")
 
             # Validate
             val_metrics = self.validate(epoch)
             logger.info(f"Validation Loss: {val_metrics['loss']:.6f}")
             for exit_name, acc in val_metrics["accuracies"].items():
                 logger.info(f"Validation Accuracy ({exit_name}): {acc:.2f}%")
+            for exit_name, acc in val_metrics["selected_accuracies"].items():
+                samples = val_metrics["selected_samples"][exit_name]
+                logger.info(f"Validation Selected Accuracy ({exit_name}): {acc:.2f}% ({samples} samples)")
 
             # Save only if this is the best model
             if val_metrics["loss"] < best_val_loss:
@@ -409,20 +332,31 @@ def parse_args():
             "sum_ce",
             "kl_consistency",
             "multi_truth_penalty",
-        ],  # Add more strategies as they are implemented
+            "adaptive_lambda",
+            "lse_ce",
+            "flattened_softmax",
+            "sum_single_head_ce",
+            "min_head_loss",
+        ],
         help="Training strategy to use",
     )
     parser.add_argument(
         "--beta",
         type=float,
         default=0.5,
-        help="Weight for KL divergence penalty in kl_consistency strategy",
+        help="Weight for KL divergence penalty in kl_consistency strategy, or temperature parameter in lse_ce strategy",
     )
     parser.add_argument(
-        "--lambda-penalty",
+        "--uniformity_weight",
         type=float,
         default=0.5,
-        help="Weight for the penalty term in multi_truth_penalty strategy",
+        help="Weight for the uniformity loss in multi_truth_penalty strategy",
+    )
+    parser.add_argument(
+        "--balance_weight",
+        type=float,
+        default=0.5,
+        help="Weight for the head balance loss in multi_truth_penalty strategy",
     )
 
     # Other parameters
@@ -445,6 +379,48 @@ def parse_args():
         default=0,
         help="ID of GPU to use for training (-1 for CPU)",
     )
+
+    # Add new arguments for adaptive lambda strategy
+    parser.add_argument(
+        "--compare-with-final",
+        action="store_true",
+        help="Compare each head with final head instead of next head in adaptive lambda strategy",
+    )
+    parser.add_argument(
+        "--lambda-increase-rate",
+        type=float,
+        default=1.1,
+        help="Rate to increase lambda by when accuracy is worse",
+    )
+    parser.add_argument(
+        "--lambda-decrease-rate",
+        type=float,
+        default=0.9,
+        help="Rate to decrease lambda by when accuracy is better",
+    )
+    parser.add_argument(
+        "--min-lambda",
+        type=float,
+        default=0.1,
+        help="Minimum value for lambda in adaptive strategy",
+    )
+    parser.add_argument(
+        "--max-lambda",
+        type=float,
+        default=10.0,
+        help="Maximum value for lambda in adaptive strategy",
+    )
+
+    # Learning rate scheduler parameters
+    parser.add_argument("--scheduler", type=str, default=None, choices=["cyclic"],
+                        help="Learning rate scheduler to use")
+    parser.add_argument("--max-lr", type=float, default=0.1,
+                        help="Maximum learning rate for cyclic scheduler")
+    parser.add_argument("--step-size-up", type=int, default=2000,
+                        help="Number of training iterations in the increasing half of a cycle")
+    parser.add_argument("--cycle-mode", type=str, default="triangular",
+                        choices=["triangular", "triangular2", "exp_range"],
+                        help="Mode for cyclic learning rate")
 
     return parser.parse_args()
 
@@ -507,7 +483,21 @@ def main():
     if args.training_strategy == "kl_consistency":
         strategy_kwargs["beta"] = args.beta
     if args.training_strategy == "multi_truth_penalty":
-        strategy_kwargs["lambda_penalty"] = args.lambda_penalty
+        strategy_kwargs["uniformity_weight"] = args.uniformity_weight
+        strategy_kwargs["balance_weight"] = args.balance_weight
+    if args.training_strategy == "adaptive_lambda":
+        strategy_kwargs.update(
+            {
+                "num_heads": len(param_counts),
+                "compare_with_final": args.compare_with_final,
+                "lambda_increase_rate": args.lambda_increase_rate,
+                "lambda_decrease_rate": args.lambda_decrease_rate,
+                "min_lambda": args.min_lambda,
+                "max_lambda": args.max_lambda,
+            }
+        )
+    if args.training_strategy == "lse_ce":
+        strategy_kwargs["beta"] = args.beta
     strategy = get_training_strategy(args.training_strategy, **strategy_kwargs)
 
     # Create optimizer and criterion using the strategy
@@ -519,6 +509,20 @@ def main():
     )
     criterion = strategy.create_criterion()
 
+    # Create scheduler if specified
+    scheduler = None
+    if args.scheduler == "cyclic":
+        scheduler = torch.optim.lr_scheduler.CyclicLR(
+            optimizer,
+            base_lr=args.lr,
+            max_lr=args.max_lr,
+            step_size_up=args.step_size_up,
+            mode=args.cycle_mode,
+            cycle_momentum=True if args.momentum > 0 else False
+        )
+        logger.info(f"Created cyclic learning rate scheduler with base_lr={args.lr}, "
+                   f"max_lr={args.max_lr}, step_size_up={args.step_size_up}, mode={args.cycle_mode}")
+
     # Create trainer
     trainer = Trainer(
         model=model,
@@ -529,6 +533,7 @@ def main():
         device=device,
         save_dir=save_dir,
         strategy=strategy,
+        scheduler=scheduler,  # Pass scheduler to trainer
     )
 
     # Train model
