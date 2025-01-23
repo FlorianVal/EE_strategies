@@ -591,23 +591,28 @@ class MinHeadLossStrategy(TrainingStrategy):
         # Create uniform distribution target
         uniform_target = torch.ones(batch_size, num_classes, device=target.device) / num_classes
 
-        # Add KL divergence loss for non-selected heads
+        # Add KL divergence loss for heads before the selected head
         kl_loss = torch.tensor(0.0, device=target.device)
         for i in range(num_heads):
-            # Create mask for samples where this head was not selected
-            not_selected_mask = (min_indices != i)
-            if not_selected_mask.any():
-                # Get outputs for this head for non-selected samples
-                head_output = outputs[exit_names[i]][not_selected_mask]
+            # For each sample, create mask for heads that come before the selected head
+            earlier_heads_mask = torch.zeros(batch_size, dtype=torch.bool, device=target.device)
+            for sample_idx in range(batch_size):
+                selected_head = min_indices[sample_idx]
+                if i < selected_head:  # Only penalize heads that come before
+                    earlier_heads_mask[sample_idx] = True
+            
+            if earlier_heads_mask.any():
+                # Get outputs for this head for samples where it comes before selected head
+                head_output = outputs[exit_names[i]][earlier_heads_mask]
                 # Compute KL divergence with uniform distribution
                 kl_loss += F.kl_div(
                     F.log_softmax(head_output, dim=1),
-                    uniform_target[not_selected_mask],
+                    uniform_target[earlier_heads_mask],
                     reduction='batchmean'
                 )
 
         # Combine minimum CE loss with KL divergence loss
-        total_loss = min_losses.mean() + 0.1 * kl_loss  # 0.1 is a weighting factor
+        total_loss = min_losses.mean() + 1 * kl_loss  # 1 is a weighting factor
 
         return total_loss
 
