@@ -6,7 +6,6 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -35,6 +34,7 @@ class Trainer:
         save_dir: str,
         strategy,
         scheduler=None,
+        enable_logging=True,
     ):
         self.model = model
         self.train_loader = train_loader
@@ -45,12 +45,18 @@ class Trainer:
         self.save_dir = save_dir
         self.strategy = strategy
         self.scheduler = scheduler
+        self.enable_logging = enable_logging
 
         # Create save directory if it doesn't exist
         os.makedirs(save_dir, exist_ok=True)
 
-        # Initialize TensorBoard writer
-        self.writer = SummaryWriter(os.path.join(save_dir, "tensorboard"))
+        # Initialize TensorBoard writer if logging enabled
+        logger.info(f"Logging enabled: {enable_logging}")
+        self.writer = (
+            SummaryWriter(os.path.join(save_dir, "tensorboard"))
+            if enable_logging
+            else None
+        )
 
     def compute_entropy(self, logits):
         """Compute entropy of softmax probabilities."""
@@ -83,7 +89,9 @@ class Trainer:
             # Forward pass
             outputs = self.model(data)
             if batch_idx == 0:
-                logger.info(f"Outputs for class {target[0].item()}: \n{[f'{x:.2f}' for x in outputs['exit1'][0].tolist()]}\n{[f'{x:.2f}' for x in outputs['exit2'][0].tolist()]}\n{[f'{x:.2f}' for x in outputs['exit3'][0].tolist()]}\n{[f'{x:.2f}' for x in outputs['final'][0].tolist()]}")
+                logger.info(
+                    f"Outputs for class {target[0].item()}: \n{[f'{x:.2f}' for x in outputs['exit1'][0].tolist()]}\n{[f'{x:.2f}' for x in outputs['exit2'][0].tolist()]}\n{[f'{x:.2f}' for x in outputs['exit3'][0].tolist()]}\n{[f'{x:.2f}' for x in outputs['final'][0].tolist()]}"
+                )
             # Calculate loss using the strategy
             loss = self.strategy.compute_loss(outputs, target, self.criterion)
 
@@ -95,9 +103,13 @@ class Trainer:
             if self.scheduler is not None:
                 self.scheduler.step()
                 # Log learning rate
-                if batch_idx % 100 == 0:
+                if self.enable_logging and batch_idx % 100 == 0:
                     current_lr = self.scheduler.get_last_lr()[0]
-                    self.writer.add_scalar("train/learning_rate", current_lr, epoch * len(self.train_loader) + batch_idx)
+                    self.writer.add_scalar(
+                        "train/learning_rate",
+                        current_lr,
+                        epoch * len(self.train_loader) + batch_idx,
+                    )
 
             total_loss += loss.item()
             total += target.size(0)
@@ -105,29 +117,44 @@ class Trainer:
             # Calculate accuracy for each exit and entropy-based selection
             with torch.no_grad():
                 # Calculate entropy for each exit
-                entropies = {exit_name: self.compute_entropy(exit_output) 
-                           for exit_name, exit_output in outputs.items()}
-                
+                entropies = {
+                    exit_name: self.compute_entropy(exit_output)
+                    for exit_name, exit_output in outputs.items()
+                }
+
                 # Find exit with minimum entropy for each sample
-                entropy_tensor = torch.stack([entropy for entropy in entropies.values()])
+                entropy_tensor = torch.stack(
+                    [entropy for entropy in entropies.values()]
+                )
                 min_entropy_indices = entropy_tensor.argmin(dim=0)
-                
+
                 for exit_name, exit_output in outputs.items():
                     pred = exit_output.argmax(dim=1)
                     correct[exit_name] += pred.eq(target).sum().item()
-                    
+
                     # Get index for current exit
                     exit_idx = list(outputs.keys()).index(exit_name)
-                    
+
                     # Find samples where this exit had minimum entropy
-                    selected_mask = (min_entropy_indices == exit_idx)
+                    selected_mask = min_entropy_indices == exit_idx
                     if selected_mask.sum() > 0:
-                        selected_correct[exit_name] += pred[selected_mask].eq(target[selected_mask]).sum().item()
+                        selected_correct[exit_name] += (
+                            pred[selected_mask].eq(target[selected_mask]).sum().item()
+                        )
                         selected_total[exit_name] += selected_mask.sum().item()
 
+                    # Log number of samples selected at each exit
+                    if self.enable_logging:
+                        self.writer.add_scalar(
+                            f"train/samples_selected_{exit_name}",
+                            selected_mask.sum().item(),
+                            epoch * len(self.train_loader) + batch_idx,
+                        )
+
             # Log batch loss to TensorBoard
-            global_step = epoch * len(self.train_loader) + batch_idx
-            self.writer.add_scalar("train/batch_loss", loss.item(), global_step)
+            if self.enable_logging:
+                global_step = epoch * len(self.train_loader) + batch_idx
+                self.writer.add_scalar("train/batch_loss", loss.item(), global_step)
 
             if batch_idx % 100 == 0:
                 logger.info(
@@ -139,26 +166,35 @@ class Trainer:
         accuracies = {
             exit_name: (100.0 * corr / total) for exit_name, corr in correct.items()
         }
-        
+
         # Calculate entropy-based selection accuracies
         selected_accuracies = {
             exit_name: (100.0 * selected_correct[exit_name] / selected_total[exit_name])
-            if selected_total[exit_name] > 0 else 0.0
+            if selected_total[exit_name] > 0
+            else 0.0
             for exit_name in selected_correct.keys()
         }
 
         # Log epoch metrics to TensorBoard
-        self.writer.add_scalar("train/epoch_loss", avg_loss, epoch)
-        for exit_name, acc in accuracies.items():
-            self.writer.add_scalar(f"train/accuracy_{exit_name}", acc, epoch)
-        for exit_name, acc in selected_accuracies.items():
-            self.writer.add_scalar(f"train/selected_accuracy_{exit_name}", acc, epoch)
+        if self.enable_logging:
+            self.writer.add_scalar("train/epoch_loss", avg_loss, epoch)
+            for exit_name, acc in accuracies.items():
+                self.writer.add_scalar(f"train/accuracy_{exit_name}", acc, epoch)
+            for exit_name, acc in selected_accuracies.items():
+                self.writer.add_scalar(
+                    f"train/selected_accuracy_{exit_name}", acc, epoch
+                )
+                self.writer.add_scalar(
+                    f"train/epoch_samples_selected_{exit_name}",
+                    selected_total[exit_name],
+                    epoch,
+                )
 
         return {
-            "loss": avg_loss, 
+            "loss": avg_loss,
             "accuracies": accuracies,
             "selected_accuracies": selected_accuracies,
-            "selected_samples": selected_total
+            "selected_samples": selected_total,
         }
 
     def validate(self, epoch: int) -> dict:
@@ -184,25 +220,31 @@ class Trainer:
                 total += target.size(0)
 
                 # Calculate entropy for each exit
-                entropies = {exit_name: self.compute_entropy(exit_output) 
-                           for exit_name, exit_output in outputs.items()}
-                
+                entropies = {
+                    exit_name: self.compute_entropy(exit_output)
+                    for exit_name, exit_output in outputs.items()
+                }
+
                 # Find exit with minimum entropy for each sample
-                entropy_tensor = torch.stack([entropy for entropy in entropies.values()])
+                entropy_tensor = torch.stack(
+                    [entropy for entropy in entropies.values()]
+                )
                 min_entropy_indices = entropy_tensor.argmin(dim=0)
 
                 # Calculate accuracy for each exit
                 for exit_name, exit_output in outputs.items():
                     pred = exit_output.argmax(dim=1)
                     correct[exit_name] += pred.eq(target).sum().item()
-                    
+
                     # Get index for current exit
                     exit_idx = list(outputs.keys()).index(exit_name)
-                    
+
                     # Find samples where this exit had minimum entropy
-                    selected_mask = (min_entropy_indices == exit_idx)
+                    selected_mask = min_entropy_indices == exit_idx
                     if selected_mask.sum() > 0:
-                        selected_correct[exit_name] += pred[selected_mask].eq(target[selected_mask]).sum().item()
+                        selected_correct[exit_name] += (
+                            pred[selected_mask].eq(target[selected_mask]).sum().item()
+                        )
                         selected_total[exit_name] += selected_mask.sum().item()
 
         # Calculate metrics
@@ -210,26 +252,33 @@ class Trainer:
         accuracies = {
             exit_name: (100.0 * corr / total) for exit_name, corr in correct.items()
         }
-        
+
         # Calculate entropy-based selection accuracies
         selected_accuracies = {
             exit_name: (100.0 * selected_correct[exit_name] / selected_total[exit_name])
-            if selected_total[exit_name] > 0 else 0.0
+            if selected_total[exit_name] > 0
+            else 0.0
             for exit_name in selected_correct.keys()
         }
 
         # Log validation metrics to TensorBoard
-        self.writer.add_scalar("val/epoch_loss", avg_loss, epoch)
-        for exit_name, acc in accuracies.items():
-            self.writer.add_scalar(f"val/accuracy_{exit_name}", acc, epoch)
-        for exit_name, acc in selected_accuracies.items():
-            self.writer.add_scalar(f"val/selected_accuracy_{exit_name}", acc, epoch)
+        if self.enable_logging:
+            self.writer.add_scalar("val/epoch_loss", avg_loss, epoch)
+            for exit_name, acc in accuracies.items():
+                self.writer.add_scalar(f"val/accuracy_{exit_name}", acc, epoch)
+            for exit_name, acc in selected_accuracies.items():
+                self.writer.add_scalar(f"val/selected_accuracy_{exit_name}", acc, epoch)
+                self.writer.add_scalar(
+                    f"val/epoch_samples_selected_{exit_name}",
+                    selected_total[exit_name],
+                    epoch,
+                )
 
         return {
-            "loss": avg_loss, 
+            "loss": avg_loss,
             "accuracies": accuracies,
             "selected_accuracies": selected_accuracies,
-            "selected_samples": selected_total
+            "selected_samples": selected_total,
         }
 
     def save_checkpoint(self, metrics: dict, epoch: int):
@@ -249,11 +298,12 @@ class Trainer:
         best_val_loss = float("inf")
 
         # Try to log model graph to TensorBoard, but don't fail if it doesn't work
-        try:
-            dummy_input = torch.randn(1, 3, 32, 32).to(self.device)
-            self.writer.add_graph(self.model, dummy_input, use_strict_trace=False)
-        except Exception as e:
-            logger.warning(f"Failed to add model graph to TensorBoard: {e}")
+        if self.enable_logging:
+            try:
+                dummy_input = torch.randn(1, 3, 32, 32).to(self.device)
+                self.writer.add_graph(self.model, dummy_input, use_strict_trace=False)
+            except Exception as e:
+                logger.warning(f"Failed to add model graph to TensorBoard: {e}")
 
         for epoch in range(num_epochs):
             logger.info(f"\nEpoch {epoch+1}/{num_epochs}")
@@ -265,7 +315,9 @@ class Trainer:
                 logger.info(f"Train Accuracy ({exit_name}): {acc:.2f}%")
             for exit_name, acc in train_metrics["selected_accuracies"].items():
                 samples = train_metrics["selected_samples"][exit_name]
-                logger.info(f"Train Selected Accuracy ({exit_name}): {acc:.2f}% ({samples} samples)")
+                logger.info(
+                    f"Train Selected Accuracy ({exit_name}): {acc:.2f}% ({samples} samples)"
+                )
 
             # Validate
             val_metrics = self.validate(epoch)
@@ -274,7 +326,9 @@ class Trainer:
                 logger.info(f"Validation Accuracy ({exit_name}): {acc:.2f}%")
             for exit_name, acc in val_metrics["selected_accuracies"].items():
                 samples = val_metrics["selected_samples"][exit_name]
-                logger.info(f"Validation Selected Accuracy ({exit_name}): {acc:.2f}% ({samples} samples)")
+                logger.info(
+                    f"Validation Selected Accuracy ({exit_name}): {acc:.2f}% ({samples} samples)"
+                )
 
             # Save only if this is the best model
             if val_metrics["loss"] < best_val_loss:
@@ -282,7 +336,8 @@ class Trainer:
                 self.save_checkpoint(val_metrics, epoch)
 
         # Close TensorBoard writer
-        self.writer.close()
+        if self.enable_logging:
+            self.writer.close()
 
 
 def parse_args():
@@ -379,6 +434,12 @@ def parse_args():
         default=0,
         help="ID of GPU to use for training (-1 for CPU)",
     )
+    parser.add_argument(
+        "--disable-logging",
+        action="store_true",
+        default=False,
+        help="Disable logging to tensorboard",
+    )
 
     # Add new arguments for adaptive lambda strategy
     parser.add_argument(
@@ -412,15 +473,32 @@ def parse_args():
     )
 
     # Learning rate scheduler parameters
-    parser.add_argument("--scheduler", type=str, default=None, choices=["cyclic"],
-                        help="Learning rate scheduler to use")
-    parser.add_argument("--max-lr", type=float, default=0.1,
-                        help="Maximum learning rate for cyclic scheduler")
-    parser.add_argument("--step-size-up", type=int, default=2000,
-                        help="Number of training iterations in the increasing half of a cycle")
-    parser.add_argument("--cycle-mode", type=str, default="triangular",
-                        choices=["triangular", "triangular2", "exp_range"],
-                        help="Mode for cyclic learning rate")
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default=None,
+        choices=["cyclic"],
+        help="Learning rate scheduler to use",
+    )
+    parser.add_argument(
+        "--max-lr",
+        type=float,
+        default=0.1,
+        help="Maximum learning rate for cyclic scheduler",
+    )
+    parser.add_argument(
+        "--step-size-up",
+        type=int,
+        default=2000,
+        help="Number of training iterations in the increasing half of a cycle",
+    )
+    parser.add_argument(
+        "--cycle-mode",
+        type=str,
+        default="triangular",
+        choices=["triangular", "triangular2", "exp_range"],
+        help="Mode for cyclic learning rate",
+    )
 
     return parser.parse_args()
 
@@ -445,7 +523,7 @@ def main():
     exp_name_str = f"_{args.exp_name}" if args.exp_name else ""
     save_dir = os.path.join(
         args.save_dir,
-        f"{args.dataset}_{args.base_model}{exp_name_str}_{timestamp}",
+        f"{timestamp}_{args.dataset}_{args.base_model}_{exp_name_str}",
     )
     os.makedirs(save_dir, exist_ok=True)
 
@@ -518,10 +596,12 @@ def main():
             max_lr=args.max_lr,
             step_size_up=args.step_size_up,
             mode=args.cycle_mode,
-            cycle_momentum=True if args.momentum > 0 else False
+            cycle_momentum=True if args.momentum > 0 else False,
         )
-        logger.info(f"Created cyclic learning rate scheduler with base_lr={args.lr}, "
-                   f"max_lr={args.max_lr}, step_size_up={args.step_size_up}, mode={args.cycle_mode}")
+        logger.info(
+            f"Created cyclic learning rate scheduler with base_lr={args.lr}, "
+            f"max_lr={args.max_lr}, step_size_up={args.step_size_up}, mode={args.cycle_mode}"
+        )
 
     # Create trainer
     trainer = Trainer(
@@ -534,6 +614,7 @@ def main():
         save_dir=save_dir,
         strategy=strategy,
         scheduler=scheduler,  # Pass scheduler to trainer
+        enable_logging=not args.disable_logging,  # Pass enable_logging to trainer
     )
 
     # Train model
