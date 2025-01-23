@@ -11,6 +11,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 class TrainingStrategy(ABC):
     """Abstract base class for different training strategies."""
 
@@ -316,7 +317,9 @@ class AdaptiveLambdaStrategy(TrainingStrategy):
         )
 
     def create_criterion(self) -> nn.Module:
-        return nn.CrossEntropyLoss(reduction="none")  # Use 'none' to apply lambda weights per sample
+        return nn.CrossEntropyLoss(
+            reduction="none"
+        )  # Use 'none' to apply lambda weights per sample
 
     def update_accuracies(self, outputs: dict, target: torch.Tensor):
         """Update accuracy statistics for the current batch."""
@@ -487,7 +490,7 @@ class FlattenedSoftmaxStrategy(TrainingStrategy):
         # [num_heads, batch_size]
         head_competition = F.softmax(target_probs, dim=0)
 
-        # Compute 1 - Σ(sᵢ²) for each sample  
+        # Compute 1 - Σ(sᵢ²) for each sample
         # [batch_size]
         loss_per_sample = 1 - (head_competition**2).sum(dim=0)
 
@@ -517,7 +520,7 @@ class SingleHeadCEStrategy(TrainingStrategy):
         # Stack outputs to [num_heads, batch_size, num_classes]
         exit_names = sorted(outputs.keys())
         stacked_outputs = torch.stack([outputs[name] for name in exit_names])
-        num_heads, batch_size, num_classes = stacked_outputs.shape  
+        num_heads, batch_size, num_classes = stacked_outputs.shape
 
         # Permute to [batch_size, num_heads, num_classes]
         stacked_outputs = torch.permute(stacked_outputs, (1, 0, 2))
@@ -534,8 +537,12 @@ class SingleHeadCEStrategy(TrainingStrategy):
             target_matrix = torch.zeros(
                 batch_size, num_heads, num_classes, device=target.device
             )
-            target_matrix.fill_(1.0 / num_classes)  # Fill all elements with 1/num_classes
-            target_matrix[:, i, :] = target_one_hot  # Override the i-th head with one-hot targets
+            target_matrix.fill_(
+                1.0 / num_classes
+            )  # Fill all elements with 1/num_classes
+            target_matrix[:, i, :] = (
+                target_one_hot  # Override the i-th head with one-hot targets
+            )
 
             # Compute loss for current head
             ce_losses[i] = nn.functional.kl_div(
@@ -556,6 +563,15 @@ class SingleHeadCEStrategy(TrainingStrategy):
 
 class MinHeadLossStrategy(TrainingStrategy):
     """Training strategy that uses the minimum loss across all heads."""
+
+    def __init__(self, use_kl_penalty: bool = True):
+        """Initialize with flag to control KL divergence penalty.
+
+        Args:
+            use_kl_penalty (bool): If True, applies KL divergence penalty to heads before the selected head.
+                                 If False, only uses minimum CE loss. Defaults to True.
+        """
+        self.use_kl_penalty = use_kl_penalty
 
     def create_optimizer(
         self, model: nn.Module, lr: float, momentum: float, weight_decay: float
@@ -588,19 +604,26 @@ class MinHeadLossStrategy(TrainingStrategy):
         # Get minimum loss for each sample
         min_losses, min_indices = torch.min(head_losses, dim=0)
 
+        if not self.use_kl_penalty:
+            return min_losses.mean()
+
         # Create uniform distribution target
-        uniform_target = torch.ones(batch_size, num_classes, device=target.device) / num_classes
+        uniform_target = (
+            torch.ones(batch_size, num_classes, device=target.device) / num_classes
+        )
 
         # Add KL divergence loss for heads before the selected head
         kl_loss = torch.tensor(0.0, device=target.device)
         for i in range(num_heads):
             # For each sample, create mask for heads that come before the selected head
-            earlier_heads_mask = torch.zeros(batch_size, dtype=torch.bool, device=target.device)
+            earlier_heads_mask = torch.zeros(
+                batch_size, dtype=torch.bool, device=target.device
+            )
             for sample_idx in range(batch_size):
                 selected_head = min_indices[sample_idx]
                 if i < selected_head:  # Only penalize heads that come before
                     earlier_heads_mask[sample_idx] = True
-            
+
             if earlier_heads_mask.any():
                 # Get outputs for this head for samples where it comes before selected head
                 head_output = outputs[exit_names[i]][earlier_heads_mask]
@@ -608,13 +631,84 @@ class MinHeadLossStrategy(TrainingStrategy):
                 kl_loss += F.kl_div(
                     F.log_softmax(head_output, dim=1),
                     uniform_target[earlier_heads_mask],
-                    reduction='batchmean'
+                    reduction="batchmean",
                 )
 
         # Combine minimum CE loss with KL divergence loss
         total_loss = min_losses.mean() + 1 * kl_loss  # 1 is a weighting factor
 
         return total_loss
+
+
+class MaxKLDivergenceStrategy(TrainingStrategy):
+    """Training strategy that maximizes KL divergence between heads while maintaining CE loss."""
+
+    def __init__(self, beta: float = 0.5):
+        """Initialize with beta parameter for KL divergence weight."""
+        self.beta = beta
+
+    def create_optimizer(
+        self, model: nn.Module, lr: float, momentum: float, weight_decay: float
+    ) -> torch.optim.Optimizer:
+        return optim.SGD(
+            model.parameters(),
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+
+    def create_criterion(self) -> nn.Module:
+        return nn.CrossEntropyLoss()
+
+    def compute_loss(
+        self, outputs: dict, target: torch.Tensor, criterion: nn.Module
+    ) -> torch.Tensor:
+        # Initialize loss with CE for each exit
+        loss = torch.tensor(0.0, device=target.device)
+
+        # Sort exits by name to ensure consistent ordering
+        exit_names = sorted(outputs.keys())
+
+        # Add CE loss for each exit
+        for exit_name in exit_names:
+            loss += criterion(outputs[exit_name], target)
+
+        # Compute KL divergence between all pairs of heads
+        kl_div_term = torch.tensor(0.0, device=target.device)
+        for i in range(len(exit_names)):
+            for j in range(i + 1, len(exit_names)):
+                head_i = outputs[exit_names[i]]
+                head_j = outputs[exit_names[j]]
+
+                # Add small epsilon to prevent log(0)
+                head_i = head_i.clamp(min=1e-7)
+                head_j = head_j.clamp(min=1e-7)
+
+                # Calculate symmetric KL divergence
+                kl_ij = torch.nn.functional.kl_div(
+                    head_i.log(), head_j, reduction="batchmean"
+                )
+                kl_ji = torch.nn.functional.kl_div(
+                    head_j.log(), head_i, reduction="batchmean"
+                )
+
+                # Add symmetric KL divergence
+                kl_div = kl_ij + kl_ji
+
+                # Check for nan and replace with 0 if needed
+                if torch.isnan(kl_div):
+                    print(
+                        f"Warning: NaN detected in KL div between heads {i} and {j}, setting to 0"
+                    )
+                    kl_div = torch.tensor(0.0, device=target.device)
+
+                # Subtract KL divergence to maximize it
+                kl_div_term -= kl_div
+
+        # Add weighted KL divergence term to the loss
+        loss += self.beta * kl_div_term
+
+        return loss
 
 
 def get_training_strategy(strategy_name: str, **kwargs) -> TrainingStrategy:
@@ -627,8 +721,9 @@ def get_training_strategy(strategy_name: str, **kwargs) -> TrainingStrategy:
         "lse_ce": lambda: LSECEStrategy(**kwargs),
         "flattened_softmax": lambda: FlattenedSoftmaxStrategy(),
         "sum_single_head_ce": lambda: SingleHeadCEStrategy(),
-        "min_head_loss": lambda: MinHeadLossStrategy(),
+        "min_head_loss": lambda: MinHeadLossStrategy(**kwargs),
+        "max_kl_divergence": lambda: MaxKLDivergenceStrategy(**kwargs),
     }
     if strategy_name not in strategies:
         raise ValueError(f"Unknown training strategy: {strategy_name}")
-    return strategies[strategy_name]() 
+    return strategies[strategy_name]()
