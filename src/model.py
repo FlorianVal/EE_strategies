@@ -89,7 +89,6 @@ class EarlyExitResNet(EarlyExitModel):
             nn.BatchNorm1d(in_features),
             nn.Dropout(p=0.5),
             nn.Linear(in_features, num_classes),
-            nn.Softmax(dim=1),
         )
 
     def forward(self, x: torch.Tensor) -> dict:
